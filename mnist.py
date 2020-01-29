@@ -1,11 +1,30 @@
+"""
+You can either create a new dataloader, or filter when you sample
+
+You don't even need to augment the data in a weird way, you can just sample at a different frequency
+"""
+
 from __future__ import print_function
 import argparse
+from collections import OrderedDict
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
+from tqdm import tqdm
+
+from starter_code.log import log_string, ClassificationLogger
+from starter_code.utils import split_groups
+
+root = './classification/runs'
 
 
 class Net(nn.Module):
@@ -48,23 +67,86 @@ def train(args, model, device, train_loader, optimizer, epoch):
                 100. * batch_idx / len(train_loader), loss.item()))
 
 
-def test(args, model, device, test_loader):
+def test(args, model, device, test_loader, epoch):
     model.eval()
     test_loss = 0
     correct = 0
+
+    # get the classes in test_loader
+    classes_correct = {label: 0 for label in set(test_loader.dataset.test_labels.numpy())}
+    classes_total = {label: 0 for label in set(test_loader.dataset.test_labels.numpy())}
+
     with torch.no_grad():
-        for data, target in test_loader:
+        for data, target in tqdm(test_loader):
             data, target = data.to(device), target.to(device)
             output = model(data)
             test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
+
+            total_correct, correct_per_class, total_per_class = compute_correct(pred, target)
+            correct += total_correct
+
+            for label in correct_per_class:
+                classes_correct[label] += correct_per_class[label]
+                classes_total[label] += total_per_class[label]
 
     test_loss /= len(test_loader.dataset)
 
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
+
+    class_accuracy = OrderedDict({
+        label: float(classes_correct[label])/classes_total[label] for label in sorted(classes_correct)})
+
+    return class_accuracy
+
+def evaluate(args, model, device, test_loader, espoch, logger):
+    class_accuracy = test(args, model, device, test_loader, epoch)
+    print(log_string(OrderedDict(class_accuracy)))
+    plot_class_accuracy(class_accuracy, 
+        fname=os.path.join(logger.logdir, 'mnist_class_accuracies_epoch{}.png'.format(epoch)))
+
+def plot_class_accuracy(class_accuracy, fname):
+    labels, accuracies = zip(*class_accuracy.items())  # note that these are normalized
+    fig, ax = plt.subplots()
+    ax.bar(labels, accuracies, align='center', alpha=0.5)
+    ax.set_xticks(range(len(labels)), map(int, labels))
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel('Accuracy')
+    ax.set_xlabel('Class')
+    plt.tight_layout()
+    plt.savefig(fname)
+    plt.close()
+
+def compute_correct(pred, target):
+    pred = pred[:20]
+    target = target[:20]
+
+    num_equal = pred.eq(target.view_as(pred)).squeeze(-1)
+    total_correct = num_equal.sum().item()
+
+    ##################################################
+
+    sorted_target, sorted_indices = torch.sort(target)
+    sorted_num_equal = num_equal[sorted_indices]
+
+    sorted_target = sorted_target.numpy()
+    sorted_num_equal = sorted_num_equal.numpy()
+
+    group_splitter = split_groups(sorted_target)
+    target_groups = group_splitter(sorted_target)
+    num_equal_groups = group_splitter(sorted_num_equal)
+
+    correct_per_class = dict()
+    total_per_class = dict()
+    for target_group, num_equal_group in zip(target_groups, num_equal_groups):
+        label_id = target_group[0]
+        correct_per_class[label_id] = sum(num_equal_group)
+        total_per_class[label_id] = len(num_equal_group)
+
+    return total_correct, correct_per_class, total_per_class
 
 
 def main():
@@ -89,6 +171,11 @@ def main():
 
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
+
+
+    parser.add_argument('--printf', action='store_true')
+
+
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -111,14 +198,19 @@ def main():
                        ])),
         batch_size=args.test_batch_size, shuffle=True, **kwargs)
 
+    args.expname = 'mnist'
+    args.subroot = 'debug'
+    logger = ClassificationLogger(args)
+
     model = Net().to(device)
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(args.epochs):
+        evaluate(args, model, device, test_loader, epoch, logger)
         train(args, model, device, train_loader, optimizer, epoch)
-        test(args, model, device, test_loader)
         scheduler.step()
+    evaluate(args, model, device, test_loader, logger, epoch, logger)
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
